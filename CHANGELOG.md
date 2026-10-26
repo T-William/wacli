@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Send: extend the `send file` and `send voice` attempt timeout by one second per 64 KiB, so uploads slower than 45 seconds no longer fail with `send timed out after 45s`. Thanks @ViaxCo (#535, #534).
+
 - Messages: read wrapped history payloads, grouped iPhone contact-card fields, and round video notes with their media and reply context. Thanks @emanuma03-alt (#529).
 
 - Dependencies: update the GraphQL parser after the 48-hour cooldown, preserving Go 1.27.0 and Node 24 minimums.
