@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Messages: read wrapped history payloads, grouped iPhone contact-card fields, and round video notes with their media and reply context. Thanks @emanuma03-alt (#529).
+
 - Dependencies: update the GraphQL parser after the 48-hour cooldown, preserving Go 1.27.0 and Node 24 minimums.
 
 ## 0.25.0 - 2026-10-23
