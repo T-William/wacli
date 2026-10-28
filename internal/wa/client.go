@@ -271,6 +271,18 @@ func (c *Client) AddEventHandler(handler func(interface{})) uint32 {
 	return cli.AddEventHandler(handler)
 }
 
+// AddEventHandlerWithSuccessStatus registers a handler whose false return makes
+// whatsmeow withhold the delivery receipt, so the server redelivers the event.
+func (c *Client) AddEventHandlerWithSuccessStatus(handler func(interface{}) bool) uint32 {
+	c.mu.Lock()
+	cli := c.client
+	c.mu.Unlock()
+	if cli == nil {
+		return 0
+	}
+	return cli.AddEventHandlerWithSuccessStatus(handler)
+}
+
 func (c *Client) RemoveEventHandler(id uint32) {
 	c.mu.Lock()
 	cli := c.client

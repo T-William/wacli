@@ -49,5 +49,18 @@ func (c *Client) init() error {
 	// "Waiting for this message" indefinitely because whatsmeow can't find the
 	// original plaintext to re-encrypt when the retry arrives.
 	c.client.UseRetryMessageStore = true
+	applyDeliveryGuarantees(c.client)
 	return nil
+}
+
+// applyDeliveryGuarantees makes a refused event recoverable. The sync handler
+// refuses (returns false) a message it could not store; whatsmeow then sends no
+// receipt and the server redelivers it on the next connect. Without the
+// decrypted-event buffer that redelivery fails (the Signal counter already
+// moved: ErrOldCounter) and the message is dropped; with it, whatsmeow replays
+// the stored plaintext. The same buffer covers a crash between decrypt and
+// store. Messages that fail to decrypt are re-requested from the phone.
+func applyDeliveryGuarantees(cli *whatsmeow.Client) {
+	cli.EnableDecryptedEventBuffer = true
+	cli.AutomaticMessageRerequestFromPhone = true
 }

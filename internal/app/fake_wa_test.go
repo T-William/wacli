@@ -31,8 +31,9 @@ type fakeWA struct {
 	autoReconnect bool
 	linkedLID     string
 
-	nextHandlerID uint32
-	handlers      map[uint32]func(interface{})
+	nextHandlerID   uint32
+	handlers        map[uint32]func(interface{})
+	successHandlers map[uint32]func(interface{}) bool
 
 	connectEvents  []interface{}
 	connectErrs    []error
@@ -55,6 +56,7 @@ type fakeWA struct {
 	getSubscribedNewslettersErr error
 	decryptedReaction           *waProto.ReactionMessage
 	decryptReactionErr          error
+	decryptReactionPanic        string
 	sendPollCalls               []fakeSendPollCall
 	sendPollVoteCalls           []fakeSendPollVoteCall
 	decryptPollVoteFunc         func(evt *events.Message) (*waE2E.PollVoteMessage, error)
@@ -142,15 +144,32 @@ func newFakeWA() *fakeWA {
 }
 
 func (f *fakeWA) emit(evt interface{}) {
+	f.emitForAck(evt)
+}
+
+// emitForAck dispatches like whatsmeow: it reports false when any success-flag
+// handler refused the event, which is when whatsmeow withholds the receipt.
+func (f *fakeWA) emitForAck(evt interface{}) bool {
 	f.mu.Lock()
 	handlers := make([]func(interface{}), 0, len(f.handlers))
 	for _, h := range f.handlers {
 		handlers = append(handlers, h)
 	}
+	flagged := make([]func(interface{}) bool, 0, len(f.successHandlers))
+	for _, h := range f.successHandlers {
+		flagged = append(flagged, h)
+	}
 	f.mu.Unlock()
 	for _, h := range handlers {
 		h(evt)
 	}
+	ok := true
+	for _, h := range flagged {
+		if !h(evt) {
+			ok = false
+		}
+	}
+	return ok
 }
 
 func (f *fakeWA) Close() { f.mu.Lock(); f.connected = false; f.mu.Unlock() }
@@ -234,9 +253,22 @@ func (f *fakeWA) AddEventHandler(handler func(interface{})) uint32 {
 	return id
 }
 
+func (f *fakeWA) AddEventHandlerWithSuccessStatus(handler func(interface{}) bool) uint32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id := f.nextHandlerID
+	f.nextHandlerID++
+	if f.successHandlers == nil {
+		f.successHandlers = map[uint32]func(interface{}) bool{}
+	}
+	f.successHandlers[id] = handler
+	return id
+}
+
 func (f *fakeWA) RemoveEventHandler(id uint32) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	delete(f.successHandlers, id)
 	delete(f.handlers, id)
 }
 
@@ -590,6 +622,9 @@ func (f *fakeWA) SendPresence(ctx context.Context, presence types.Presence) erro
 }
 
 func (f *fakeWA) DecryptReaction(ctx context.Context, reaction *events.Message) (*waProto.ReactionMessage, error) {
+	if f.decryptReactionPanic != "" {
+		panic(f.decryptReactionPanic)
+	}
 	if f.decryptReactionErr != nil {
 		return nil, f.decryptReactionErr
 	}

@@ -62,10 +62,14 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 	if !opts.WebhookEvents.Enabled(SyncWebhookEventMessage) {
 		enqueueWebhookMessage = func(wa.ParsedMessage) {}
 	}
-	return a.wa.AddEventHandler(func(evt interface{}) {
+	// A false return withholds the receipt: a message is acked to WhatsApp only
+	// after it is stored, so a store failure is redelivered instead of lost.
+	return a.wa.AddEventHandlerWithSuccessStatus(func(evt interface{}) (ok bool) {
+		ok = true
+		_, isMessage := evt.(*events.Message)
 		if mediaQ != nil {
 			if !mediaQ.beginProducer() {
-				return
+				return !isMessage // shutting down: a message we cannot store is not acked
 			}
 			defer mediaQ.endProducer()
 		}
@@ -77,6 +81,9 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 		// process. Include event type, stack trace, and a running counter.
 		defer func() {
 			if r := recover(); r != nil {
+				if isMessage {
+					ok = false
+				}
 				n := panicCount.Add(1)
 				if a.eventsEnabled() {
 					a.emitEvent("event_handler_panic", map[string]any{
@@ -98,10 +105,19 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 				if notif.GetSyncType() == waE2E.HistorySyncType_ON_DEMAND {
 					return
 				}
-				a.downloadAndHandleHistorySync(ctx, opts, notif, messagesStored, lastEvent, enqueueMedia, limits)
+				ok = a.downloadAndHandleHistorySync(ctx, opts, notif, messagesStored, lastEvent, enqueueMedia, limits)
 				return
 			}
-			a.handleLiveSyncMessage(ctx, opts, v, messagesStored, enqueueMedia, enqueueWebhookMessage, limits)
+			ok = a.handleLiveSyncMessage(ctx, opts, v, messagesStored, enqueueMedia, enqueueWebhookMessage, limits)
+		case *events.UndecryptableMessage:
+			lastEvent.Store(nowUTC().UnixNano())
+			a.emitOrPrint("undecryptable", map[string]any{
+				"message_id":     string(v.Info.ID),
+				"chat":           v.Info.Chat.String(),
+				"sender":         v.Info.Sender.String(),
+				"timestamp":      v.Info.Timestamp.UTC().Format(time.RFC3339),
+				"is_unavailable": v.IsUnavailable,
+			}, "\nwarning: could not decrypt message %s in %s (re-requested from the phone)\n", v.Info.ID, v.Info.Chat)
 		case *events.CallOffer, *events.CallAccept, *events.CallPreAccept, *events.CallTransport,
 			*events.CallOfferNotice, *events.CallRelayLatency, *events.CallTerminate, *events.CallReject:
 			lastEvent.Store(nowUTC().UnixNano())
@@ -191,6 +207,7 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 			default:
 			}
 		}
+		return
 	})
 }
 
@@ -539,16 +556,23 @@ func (a *App) handleAppStateSyncError(ctx context.Context, evt *events.AppStateS
 	}()
 }
 
-func (a *App) handleLiveSyncMessage(ctx context.Context, opts SyncOptions, v *events.Message, messagesStored *atomic.Int64, enqueueMedia func(string, string), enqueueWebhook func(wa.ParsedMessage), limits ...*syncStorageLimits) {
+// handleLiveSyncMessage reports whether the message may be acked: true once it
+// is stored (or deliberately not stored), false when storing it failed.
+func (a *App) handleLiveSyncMessage(ctx context.Context, opts SyncOptions, v *events.Message, messagesStored *atomic.Int64, enqueueMedia func(string, string), enqueueWebhook func(wa.ParsedMessage), limits ...*syncStorageLimits) bool {
 	if historySyncNotificationFromMessage(v) != nil {
-		return
+		return true
 	}
 	pm := wa.ParseLiveMessage(v)
 	if pm.ReactionToID != "" && pm.ReactionEmoji == "" && v.Message != nil && v.Message.GetEncReactionMessage() != nil {
 		a.decryptEncryptedReaction(ctx, &pm, v)
 	}
 	incrementUnread := a.shouldIncrementLiveUnread(ctx, pm)
-	if err := a.storeParsedMessageForSync(ctx, pm, limits...); err == nil {
+	err := a.storeParsedMessageForSync(ctx, pm, limits...)
+	if err != nil && !storageLimitReached(limits) {
+		a.emitStoreFailed(pm.ID, pm.Chat.String(), err)
+		return false
+	}
+	if err == nil {
 		if incrementUnread {
 			a.incrementLiveUnread(ctx, pm)
 		}
@@ -565,9 +589,26 @@ func (a *App) handleLiveSyncMessage(ctx context.Context, opts SyncOptions, v *ev
 	if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
 		enqueueMedia(canonicalJIDString(a.canonicalStoreJID(ctx, pm.Chat)), pm.ID)
 	}
+	return true
 }
 
-func (a *App) downloadAndHandleHistorySync(ctx context.Context, opts SyncOptions, notif *waE2E.HistorySyncNotification, messagesStored, lastEvent *atomic.Int64, enqueueMedia func(string, string), limits ...*syncStorageLimits) {
+// storageLimitReached is true when a store error is the user's own
+// --max-messages / --max-db-size cap: that message is dropped by choice.
+func storageLimitReached(limits []*syncStorageLimits) bool {
+	return len(limits) > 0 && limits[0] != nil && limits[0].Err() != nil
+}
+
+func (a *App) emitStoreFailed(msgID, chat string, err error) {
+	a.emitOrPrint("store_failed", map[string]any{
+		"message_id": msgID,
+		"chat":       chat,
+		"error":      err.Error(),
+	}, "\nwarning: failed to store message %s in %s: %v (not acked; WhatsApp redelivers it on reconnect)\n", msgID, chat, err)
+}
+
+// downloadAndHandleHistorySync reports whether the chunk may be acked. A chunk
+// that failed to download or store keeps its server copy and is not acked.
+func (a *App) downloadAndHandleHistorySync(ctx context.Context, opts SyncOptions, notif *waE2E.HistorySyncNotification, messagesStored, lastEvent *atomic.Int64, enqueueMedia func(string, string), limits ...*syncStorageLimits) bool {
 	data, err := a.wa.DownloadHistorySync(ctx, notif)
 	if err != nil {
 		a.emitWarning(
@@ -575,9 +616,11 @@ func (a *App) downloadAndHandleHistorySync(ctx context.Context, opts SyncOptions
 			fmt.Sprintf("warning: failed to download history sync: %v", err),
 			map[string]any{"error": err.Error()},
 		)
-		return
+		return false
 	}
-	a.handleHistorySync(ctx, opts, &events.HistorySync{Data: data}, messagesStored, lastEvent, enqueueMedia, limits...)
+	if !a.handleHistorySync(ctx, opts, &events.HistorySync{Data: data}, messagesStored, lastEvent, enqueueMedia, limits...) {
+		return false
+	}
 	if err := a.wa.DeleteHistorySyncMedia(ctx, notif); err != nil {
 		a.emitWarning(
 			"history_delete_failed",
@@ -585,6 +628,7 @@ func (a *App) downloadAndHandleHistorySync(ctx context.Context, opts SyncOptions
 			map[string]any{"error": err.Error()},
 		)
 	}
+	return true
 }
 
 func historySyncNotificationFromMessage(v *events.Message) *waE2E.HistorySyncNotification {
@@ -640,7 +684,10 @@ func (w *historyUnhandledPayloadWarnings) flush(a *App) {
 	)
 }
 
-func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events.HistorySync, messagesStored, lastEvent *atomic.Int64, enqueueMedia func(string, string), limits ...*syncStorageLimits) {
+// handleHistorySync reports whether every message in the chunk was stored (or
+// deliberately skipped).
+func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events.HistorySync, messagesStored, lastEvent *atomic.Int64, enqueueMedia func(string, string), limits ...*syncStorageLimits) bool {
+	complete := true
 	var unhandledWarnings historyUnhandledPayloadWarnings
 	defer unhandledWarnings.flush(a)
 	a.emitOrPrint("history_sync", map[string]any{"conversations": len(v.Data.Conversations)}, "\nProcessing history sync (%d conversations)...\n", len(v.Data.Conversations))
@@ -689,7 +736,10 @@ func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events
 				}
 			} else if ctx.Err() != nil {
 				a.handleHistoryPollSideEffectsBatch(context.WithoutCancel(ctx), pendingPolls)
-				return
+				return false
+			} else if !storageLimitReached(limits) {
+				a.emitStoreFailed(pm.ID, pm.Chat.String(), err)
+				complete = false
 			}
 			if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
 				enqueueMedia(canonicalJIDString(a.canonicalStoreJID(ctx, pm.Chat)), pm.ID)
@@ -704,6 +754,7 @@ func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events
 	if !a.eventsEnabled() {
 		a.emitOrPrint("progress", map[string]any{"messages_synced": messagesStored.Load()}, "\rSynced %d messages...", messagesStored.Load())
 	}
+	return complete
 }
 
 func (a *App) storeHistoryCallLogRecords(ctx context.Context, v *events.HistorySync, lastEvent *atomic.Int64) {
